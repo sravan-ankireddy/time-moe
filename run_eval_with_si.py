@@ -7,9 +7,10 @@ import numpy as np
 import logging
 import torch
 import torch.distributed as dist
-from torch.utils.data import DistributedSampler, DataLoader
+from torch.utils.data import DistributedSampler, DataLoader, Subset
 from tqdm import tqdm
 import matplotlib.pyplot as plt
+import pandas as pd
 
 from transformers import AutoModelForCausalLM
 
@@ -112,6 +113,19 @@ def evaluate(args):
     prediction_length = args.prediction_length
     downsample_rates = args.downsample_rates
 
+    # Handle column extraction if specified
+    temp_csv_file = None
+    data_file = args.data
+    
+    if args.date_col_idx is not None and args.data_col_idx is not None:
+        if not args.data.endswith('.csv'):
+            raise ValueError("Column extraction is only supported for CSV files")
+        temp_csv_file = create_temp_csv(args.data, args.date_col_idx, args.data_col_idx)
+        data_file = temp_csv_file
+        print(f"Using temporary extracted CSV: {temp_csv_file}")
+    elif args.date_col_idx is not None or args.data_col_idx is not None:
+        raise ValueError("Both date_col_idx and data_col_idx must be specified together")
+
     master_addr = os.getenv('MASTER_ADDR', '127.0.0.1')
     master_port = os.getenv('MASTER_PORT', 9899)
     world_size = int(os.getenv('WORLD_SIZE') or 1)
@@ -158,18 +172,27 @@ def evaluate(args):
             downsample_rate=downsample_rate
         )
         
-        if args.data.endswith('.csv'):
+        if data_file.endswith('.csv'):
             dataset = BenchmarkEvalDataset(
-                args.data,
+                data_file,
                 context_length=context_length,
                 prediction_length=prediction_length,
             )
         else:
             dataset = GeneralEvalDataset(
-                args.data,
+                data_file,
                 context_length=context_length,
                 prediction_length=prediction_length,
             )
+
+        # Limit dataset size if max_samples is specified
+        if args.max_samples is not None and args.max_samples < len(dataset):
+            # Create indices for subset
+            subset_indices = list(range(min(args.max_samples, len(dataset))))
+            dataset = Subset(dataset, subset_indices)
+            print(f"Using subset of {len(dataset)} samples (max_samples={args.max_samples})")
+        else:
+            print(f"Using full dataset with {len(dataset)} samples")
 
         if torch.cuda.is_available() and dist.is_initialized():
             sampler = DistributedSampler(dataset=dataset, shuffle=False)
@@ -257,6 +280,14 @@ def evaluate(args):
     if rank == 0 and len(downsample_rates) > 1:
         plot_results(all_results, args)
         plot_sample_predictions(sample_data, args)
+    
+    # Clean up temporary file if created
+    if temp_csv_file and os.path.exists(temp_csv_file):
+        try:
+            os.remove(temp_csv_file)
+            print(f"Cleaned up temporary file: {temp_csv_file}")
+        except OSError as e:
+            print(f"Warning: Could not remove temporary file {temp_csv_file}: {e}")
 
 
 def plot_results(results, args):
@@ -295,7 +326,7 @@ def plot_results(results, args):
     
     # Create structured folder and save plot
     dataset_name = os.path.basename(args.data).split('.')[0]
-    results_dir = f"results/{dataset_name}"
+    results_dir = f"results/{dataset_name}/col_{args.data_col_idx}"
     os.makedirs(results_dir, exist_ok=True)
     
     plot_filename = f"{results_dir}/p{args.prediction_length}_c{args.context_length}.png"
@@ -311,7 +342,7 @@ def plot_sample_predictions(sample_data, args):
         
     # Create base directory structure
     dataset_name = os.path.basename(args.data).split('.')[0]
-    base_results_dir = f"results/{dataset_name}"
+    base_results_dir = f"results/{dataset_name}/col_{args.data_col_idx}"
     samples_dir = f"{base_results_dir}/sample_predictions_p{args.prediction_length}_c{args.context_length}"
     os.makedirs(samples_dir, exist_ok=True)
     
@@ -384,6 +415,49 @@ def plot_sample_predictions(sample_data, args):
     print(f"Generated {min(5, min(len(sample_data[rate]) for rate in selected_samples))} individual sample plots")
 
 
+def create_temp_csv(csv_file, date_col_idx, data_col_idx):
+    """
+    Extract specified date and data columns from CSV and create a temporary file.
+    
+    Args:
+        csv_file: Path to the source CSV file
+        date_col_idx: Index of the date column (0-based)
+        data_col_idx: Index of the data column (0-based)
+    
+    Returns:
+        Path to the temporary CSV file
+    """
+    # Read the CSV file
+    df = pd.read_csv(csv_file)
+    
+    # Extract the specified columns
+    date_col = df.iloc[:, date_col_idx]
+    data_col = df.iloc[:, data_col_idx]
+    
+    # Create a new dataframe with extracted columns
+    temp_df = pd.DataFrame({
+        df.columns[date_col_idx]: date_col,
+        df.columns[data_col_idx]: data_col
+    })
+    
+    # Create temp directory if it doesn't exist
+    temp_dir = "temp"
+    os.makedirs(temp_dir, exist_ok=True)
+    
+    # Create temporary file in the temp directory
+    import time
+    timestamp = int(time.time())
+    base_name = os.path.splitext(os.path.basename(csv_file))[0]
+    temp_filename = f"{temp_dir}/{base_name}_extracted_{timestamp}.csv"
+    
+    temp_df.to_csv(temp_filename, index=False)
+    
+    print(f"Created temporary CSV with {len(temp_df)} rows: {temp_filename}")
+    print(f"Columns: {list(temp_df.columns)}")
+    
+    return temp_filename
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('TimeMoE Evaluate')
     parser.add_argument(
@@ -427,6 +501,24 @@ if __name__ == '__main__':
         type=int,
         default=None,
         help='Maximum number of batches to evaluate (default: all batches)'
+    )
+    parser.add_argument(
+        '--max_samples',
+        type=int,
+        default=None,
+        help='Maximum number of samples to evaluate (default: all samples). Useful for quick testing.'
+    )
+    parser.add_argument(
+        '--date_col_idx',
+        type=int,
+        default=0,
+        help='Index of the date column in the CSV file (0-based). If specified, will extract columns and create temp CSV.'
+    )
+    parser.add_argument(
+        '--data_col_idx', 
+        type=int,
+        default=1,
+        help='Index of the data column in the CSV file (0-based). Required if date_col_idx is specified.'
     )
     args = parser.parse_args()
     if args.context_length is None:
