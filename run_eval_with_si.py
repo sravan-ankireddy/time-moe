@@ -29,6 +29,51 @@ def count_num_tensor_elements(tensor):
     return n
 
 
+# ------------------ Self-Information Computation ------------------
+def compute_self_information(model, context_data, device, si_context_length=512):
+    """
+    Compute self-information for each sample in the context using autoregressive prediction.
+    Self-information is computed as MSE between predicted and actual values.
+    Uses a fixed context length for each prediction.
+    
+    Args:
+        model: TimeMoE model for prediction
+        context_data: numpy array of shape (context_length,) - the context sequence
+        device: device to run computation on
+        si_context_length: fixed number of context samples to use for each prediction
+    
+    Returns:
+        si_scores: numpy array of self-information scores (MSE) for each position
+        predictions: numpy array of predicted values for each position
+    """
+    context_length = len(context_data)
+    si_scores = []
+    predictions = []
+    
+    # We can only compute SI for positions that have enough previous context
+    # Start from si_context_length to ensure we always have exactly si_context_length samples
+    for i in tqdm(range(si_context_length, context_length), desc="Computing SI", leave=False):
+        # Use exactly si_context_length samples as context to predict sample at position i
+        context_start = i - si_context_length
+        context_subset = context_data[context_start:i]
+        true_value = context_data[i]
+        
+        # Prepare input tensor
+        context_tensor = torch.tensor(context_subset, dtype=torch.float32).unsqueeze(0).to(device)
+        
+        # Generate single-step prediction
+        predicted_tensor = model.predict_single_step(context_tensor)
+        predicted_value = predicted_tensor.cpu().float().numpy().item()
+        
+        # Compute self-information as MSE (since we don't have variance)
+        mse = (predicted_value - true_value) ** 2
+        
+        si_scores.append(mse)
+        predictions.append(predicted_value)
+    
+    return np.array(si_scores), np.array(predictions)
+
+
 # ------------------ Metrics ------------------
 class SumEvalMetric:
     def __init__(self, name, init_val: float = 0.0):
@@ -81,6 +126,30 @@ class TimeMoE:
         self.model = model
         self.device = device
         self.model.eval()
+
+    def predict_single_step(self, context):
+        """
+        Predict a single time step given context.
+        
+        Args:
+            context: tensor of shape (batch_size, context_length) or (context_length,)
+        
+        Returns:
+            prediction: tensor of shape (batch_size, 1) or scalar
+        """
+        if len(context.shape) == 1:
+            context = context.unsqueeze(0)
+        
+        context = context.to(self.device).to(self.model.dtype)
+        
+        with torch.no_grad():
+            outputs = self.model.generate(
+                inputs=context,
+                max_new_tokens=1,
+            )
+            prediction = outputs[:, -1]  # Get the last predicted token
+        
+        return prediction
 
     def predict(self, batch):
         model = self.model
@@ -281,6 +350,51 @@ def evaluate(args):
         plot_results(all_results, args)
         plot_sample_predictions(sample_data, args)
     
+    # Self-Information based evaluation
+    if args.enable_si and rank == 0:
+        print("\n" + "="*60)
+        print("SELF-INFORMATION BASED EVALUATION")
+        print("Computing self-information scores for 3 random context samples...")
+        print(f"Using fixed SI context length: {args.si_context_length}")
+        print("="*60)
+        
+        # Use the model with downsample_rate=1 for SI computation
+        si_model = TimeMoE(
+            args.model,
+            device,
+            context_length=args.si_context_length,  # Use SI context length for model
+            prediction_length=1,  # Single-step prediction for SI
+            downsample_rate=1
+        )
+        
+        # Get the dataset - we need to create a new dataset with extended context for SI
+        # Load dataset with extended context length to ensure we have enough previous samples
+        extended_context_length = context_length + args.si_context_length
+        
+        if data_file.endswith('.csv'):
+            extended_dataset = BenchmarkEvalDataset(
+                data_file,
+                context_length=extended_context_length,
+                prediction_length=prediction_length,
+            )
+        else:
+            extended_dataset = GeneralEvalDataset(
+                data_file,
+                context_length=extended_context_length,
+                prediction_length=prediction_length,
+            )
+        
+        # Randomly select 3 samples from the extended dataset
+        import random
+        random.seed(42)  # For reproducible results
+        selected_indices = random.sample(range(len(extended_dataset)), min(3, len(extended_dataset)))
+        
+        print(f"Selected samples: {selected_indices}")
+        print(f"Extended context length for SI: {extended_context_length}")
+        
+        # Compute SI for selected samples and plot
+        plot_si_for_samples(si_model, extended_dataset, selected_indices, device, args)
+    
     # Clean up temporary file if created
     if temp_csv_file and os.path.exists(temp_csv_file):
         try:
@@ -326,7 +440,7 @@ def plot_results(results, args):
     
     # Create structured folder and save plot
     dataset_name = os.path.basename(args.data).split('.')[0]
-    results_dir = f"results/{dataset_name}/col_{args.data_col_idx}"
+    results_dir = f"results_with_si/{dataset_name}/col_{args.data_col_idx}"
     os.makedirs(results_dir, exist_ok=True)
     
     plot_filename = f"{results_dir}/p{args.prediction_length}_c{args.context_length}.png"
@@ -342,7 +456,7 @@ def plot_sample_predictions(sample_data, args):
         
     # Create base directory structure
     dataset_name = os.path.basename(args.data).split('.')[0]
-    base_results_dir = f"results/{dataset_name}/col_{args.data_col_idx}"
+    base_results_dir = f"results_with_si/{dataset_name}/col_{args.data_col_idx}"
     samples_dir = f"{base_results_dir}/sample_predictions_p{args.prediction_length}_c{args.context_length}"
     os.makedirs(samples_dir, exist_ok=True)
     
@@ -387,13 +501,13 @@ def plot_sample_predictions(sample_data, args):
             ax = axes[row]
             
             # Plot context with markers only
-            ax.plot(context_time, context, 'bo', label='Context', markersize=4)
+            ax.plot(context_time, context, 'b-.o', label='Context', markersize=4)
             
             # Plot ground truth with markers only
-            ax.plot(pred_time, ground_truth, 'gs', label='Ground Truth', markersize=4)
-            
+            ax.plot(pred_time, ground_truth, 'g-.s', label='Ground Truth', markersize=4)
+
             # Plot prediction with markers only
-            ax.plot(pred_time, prediction, 'r^', label='Prediction', markersize=4)
+            ax.plot(pred_time, prediction, 'r-.^', label='Prediction', markersize=4)
             
             ax.axvline(x=0, color='black', linestyle=':', alpha=0.7, linewidth=1)
             ax.set_title(f'Downsample Rate {rate}', fontsize=14)
@@ -458,6 +572,143 @@ def create_temp_csv(csv_file, date_col_idx, data_col_idx):
     return temp_filename
 
 
+def plot_si_for_samples(model, dataset, selected_indices, device, args):
+    """Plot self-information analysis for selected samples - create separate plots for each sample."""
+    
+    # Create directory for SI plots
+    dataset_name = os.path.basename(args.data).split('.')[0]
+    base_results_dir = f"results_with_si/{dataset_name}/col_{args.data_col_idx}"
+    si_dir = f"{base_results_dir}/si_analysis_p{args.prediction_length}_c{args.context_length}"
+    os.makedirs(si_dir, exist_ok=True)
+    
+    # Process each sample with progress bar
+    for plot_idx, sample_idx in enumerate(tqdm(selected_indices, desc="Processing samples", unit="sample")):
+        sample = dataset[sample_idx]
+        context_data = sample['inputs']
+        
+        # Convert to numpy array if it's a tensor
+        if hasattr(context_data, 'numpy'):
+            context_data = context_data.numpy()
+        elif not isinstance(context_data, np.ndarray):
+            context_data = np.array(context_data)
+        
+        print(f"Processing sample {sample_idx}: context length = {len(context_data)}")
+        
+        # Compute self-information scores
+        si_scores, si_predictions = compute_self_information(
+            model, context_data, device, args.si_context_length
+        )
+        
+        # Extract only the portion of context for which we computed SI
+        # This corresponds to the original context window, not the extended one
+        si_start_idx = args.si_context_length  # Start of SI computation
+        si_end_idx = len(context_data)  # End of the data
+        
+        # Get the context portion for which we have SI scores
+        relevant_context = context_data[si_start_idx:si_end_idx]
+        
+        # Create individual plot for this sample
+        fig, ax = plt.subplots(1, 1, figsize=(15, 8))
+        
+        # Plot only the relevant context signal (for which we computed SI)
+        context_positions = np.arange(len(relevant_context))
+        ax.plot(context_positions, relevant_context, 'b-.o', alpha=0.7, linewidth=1, markersize=4, label='Context Signal')
+        
+        # Plot predictions (starts at position 0 in the relevant context)
+        pred_positions = np.arange(len(si_predictions))
+        ax.plot(pred_positions, si_predictions, 'r-.o', alpha=0.8, linewidth=1, markersize=4, label='Predictions')
+        
+        # Create a second y-axis for self-information scores
+        ax2 = ax.twinx()
+        si_positions = np.arange(len(si_scores))
+        ax2.plot(si_positions, si_scores, 'g-.o', alpha=0.6, markersize=6, linewidth=1, label='Self-Information (MSE)')
+        
+        # Formatting
+        ax.set_title(f'Sample {sample_idx}: Context Signal, Predictions, and Self-Information', fontsize=16)
+        ax.set_xlabel('Position in Context Window', fontsize=12)
+        ax.set_ylabel('Signal Value', color='b', fontsize=12)
+        ax2.set_ylabel('Self-Information (MSE)', color='g', fontsize=12)
+        ax.grid(True, alpha=0.3)
+        
+        # Add legends
+        ax.legend(loc='upper left', fontsize=10)
+        ax2.legend(loc='upper right', fontsize=10)
+        
+        # Color the y-axis labels
+        ax.tick_params(axis='y', labelcolor='b')
+        ax2.tick_params(axis='y', labelcolor='g')
+        
+        plt.tight_layout()
+        
+        # Save individual plot
+        plot_filename = f"{si_dir}/si_sample_{sample_idx}.png"
+        plt.savefig(plot_filename, dpi=300, bbox_inches='tight')
+        plt.close()  # Close to free memory
+        
+        # Create zoomed-in plot showing only the last 256 samples
+        zoom_samples = 256
+        if len(relevant_context) > zoom_samples:
+            # Create zoomed plot
+            fig_zoom, ax_zoom = plt.subplots(1, 1, figsize=(15, 8))
+            
+            # Get the last 256 samples
+            zoom_context = relevant_context[-zoom_samples:]
+            zoom_predictions = si_predictions[-zoom_samples:] if len(si_predictions) >= zoom_samples else si_predictions
+            zoom_si_scores = si_scores[-zoom_samples:] if len(si_scores) >= zoom_samples else si_scores
+            
+            # Plot zoomed context signal
+            zoom_context_positions = np.arange(len(zoom_context))
+            ax_zoom.plot(zoom_context_positions, zoom_context, 'b-.o', alpha=0.7, linewidth=1, markersize=4, label='Context Signal')
+            
+            # Plot zoomed predictions
+            zoom_pred_positions = np.arange(len(zoom_predictions))
+            ax_zoom.plot(zoom_pred_positions, zoom_predictions, 'r-.o', alpha=0.8, linewidth=1, markersize=4, label='Predictions')
+            
+            # Create second y-axis for zoomed SI scores
+            ax2_zoom = ax_zoom.twinx()
+            zoom_si_positions = np.arange(len(zoom_si_scores))
+            ax2_zoom.plot(zoom_si_positions, zoom_si_scores, 'g-.o', alpha=0.6, markersize=6, linewidth=1, label='Self-Information (MSE)')
+            
+            # Formatting for zoomed plot
+            ax_zoom.set_title(f'Sample {sample_idx}: Zoomed View (Last {zoom_samples} samples)', fontsize=16)
+            ax_zoom.set_xlabel('Position in Context Window', fontsize=12)
+            ax_zoom.set_ylabel('Signal Value', color='b', fontsize=12)
+            ax2_zoom.set_ylabel('Self-Information (MSE)', color='g', fontsize=12)
+            ax_zoom.grid(True, alpha=0.3)
+            
+            # Add legends for zoomed plot
+            ax_zoom.legend(loc='upper left', fontsize=10)
+            ax2_zoom.legend(loc='upper right', fontsize=10)
+            
+            # Color the y-axis labels for zoomed plot
+            ax_zoom.tick_params(axis='y', labelcolor='b')
+            ax2_zoom.tick_params(axis='y', labelcolor='g')
+            
+            plt.tight_layout()
+            
+            # Save zoomed plot
+            zoom_plot_filename = f"{si_dir}/si_sample_{sample_idx}_zoom.png"
+            plt.savefig(zoom_plot_filename, dpi=300, bbox_inches='tight')
+            plt.close()  # Close to free memory
+            
+            print(f"  Zoomed plot saved as: {zoom_plot_filename}")
+        
+        print(f"  Mean SI score: {np.mean(si_scores):.4f}")
+        print(f"  SI score range: [{np.min(si_scores):.4f}, {np.max(si_scores):.4f}]")
+        print(f"  Relevant context length: {len(relevant_context)}")
+        print(f"  SI predictions length: {len(si_predictions)}")
+        print(f"  Full plot saved as: {plot_filename}")
+    
+    print(f"\nAll self-information plots saved in: {si_dir}/")
+    print(f"Generated {len(selected_indices)} individual sample plots")
+
+
+# Remove the old plotting function
+def plot_si_analysis_old(si_results, args):
+    """Old plotting function - not used anymore."""
+    pass
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('TimeMoE Evaluate')
     parser.add_argument(
@@ -520,6 +771,17 @@ if __name__ == '__main__':
         default=1,
         help='Index of the data column in the CSV file (0-based). Required if date_col_idx is specified.'
     )
+    parser.add_argument(
+        '--enable_si',
+        action='store_true',
+        help='Enable self-information based evaluation'
+    )
+    parser.add_argument(
+        '--si_context_length',
+        type=int,
+        default=None,
+        help='Fixed context length for SI computation (default: same as context_length)'
+    )
     args = parser.parse_args()
     if args.context_length is None:
         if args.prediction_length == 96:
@@ -532,4 +794,9 @@ if __name__ == '__main__':
             args.context_length = 3072
         else:
             args.context_length = args.prediction_length * 4
+    
+    # Set default si_context_length to be same as context_length
+    if args.si_context_length is None:
+        args.si_context_length = args.context_length
+    
     evaluate(args)
