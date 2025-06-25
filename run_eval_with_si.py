@@ -30,17 +30,18 @@ def count_num_tensor_elements(tensor):
 
 
 # ------------------ Self-Information Computation ------------------
-def compute_self_information(model, context_data, device, si_context_length=512):
+def compute_self_information(model, context_data, device, si_context_length=512, stride=1):
     """
-    Compute self-information for each sample in the context using autoregressive prediction.
+    Compute self-information for each sample in the context using autoregressive prediction with stride.
     Self-information is computed as MSE between predicted and actual values.
-    Uses a fixed context length for each prediction.
+    Uses a fixed context length for each prediction and slides the window by stride steps.
     
     Args:
         model: TimeMoE model for prediction
         context_data: numpy array of shape (context_length,) - the context sequence
         device: device to run computation on
         si_context_length: fixed number of context samples to use for each prediction
+        stride: number of steps to predict at once and slide the window
     
     Returns:
         si_scores: numpy array of self-information scores (MSE) for each position
@@ -52,24 +53,43 @@ def compute_self_information(model, context_data, device, si_context_length=512)
     
     # We can only compute SI for positions that have enough previous context
     # Start from si_context_length to ensure we always have exactly si_context_length samples
-    for i in tqdm(range(si_context_length, context_length), desc="Computing SI", leave=False):
-        # Use exactly si_context_length samples as context to predict sample at position i
-        context_start = i - si_context_length
-        context_subset = context_data[context_start:i]
-        true_value = context_data[i]
+    total_positions = context_length - si_context_length
+    
+    # Calculate number of stride windows needed
+    num_windows = (total_positions + stride - 1) // stride  # Ceiling division
+    
+    for window_idx in tqdm(range(num_windows), desc="Computing SI with stride", leave=False):
+        # Calculate the starting position for this window
+        window_start = si_context_length + window_idx * stride
+        window_end = min(window_start + stride, context_length)
+        actual_stride = window_end - window_start
+        
+        if actual_stride <= 0:
+            break
+            
+        # Use exactly si_context_length samples as context to predict the next stride samples
+        context_start = window_start - si_context_length
+        context_subset = context_data[context_start:window_start]
+        true_values = context_data[window_start:window_end]
         
         # Prepare input tensor
         context_tensor = torch.tensor(context_subset, dtype=torch.float32).unsqueeze(0).to(device)
         
-        # Generate single-step prediction
-        predicted_tensor = model.predict_single_step(context_tensor)
-        predicted_value = predicted_tensor.cpu().float().numpy().item()
+        # Generate stride-step prediction
+        predicted_tensor = model.predict_with_stride(context_tensor, stride=actual_stride)
+        predicted_values = predicted_tensor.cpu().float().numpy().flatten()
         
-        # Compute self-information as MSE (since we don't have variance)
-        mse = (predicted_value - true_value) ** 2
+        # Ensure we have the right number of predictions
+        if len(predicted_values) != actual_stride:
+            # Handle case where model returns different number of predictions
+            predicted_values = predicted_values[:actual_stride]
         
-        si_scores.append(mse)
-        predictions.append(predicted_value)
+        # Compute self-information as MSE for each predicted step
+        for i in range(actual_stride):
+            if i < len(predicted_values) and i < len(true_values):
+                mse = (predicted_values[i] - true_values[i]) ** 2
+                si_scores.append(mse)
+                predictions.append(predicted_values[i])
     
     return np.array(si_scores), np.array(predictions)
 
@@ -127,15 +147,16 @@ class TimeMoE:
         self.device = device
         self.model.eval()
 
-    def predict_single_step(self, context):
+    def predict_with_stride(self, context, stride=1):
         """
         Predict a single time step given context.
         
         Args:
             context: tensor of shape (batch_size, context_length) or (context_length,)
-        
+            stride: the number of steps to move the context window for each prediction
+
         Returns:
-            prediction: tensor of shape (batch_size, 1) or scalar
+            prediction: tensor of shape (batch_size, stride) or scalar
         """
         if len(context.shape) == 1:
             context = context.unsqueeze(0)
@@ -145,9 +166,9 @@ class TimeMoE:
         with torch.no_grad():
             outputs = self.model.generate(
                 inputs=context,
-                max_new_tokens=1,
+                max_new_tokens=stride,
             )
-            prediction = outputs[:, -1]  # Get the last predicted token
+            prediction = outputs[:, -stride:]  # Get the last predicted tokens
         
         return prediction
 
@@ -283,10 +304,10 @@ def evaluate(args):
             for idx, batch in enumerate(tqdm(test_dl, desc=f"Evaluating downsample_rate={downsample_rate}")):
                 preds, labels = model.predict(batch)
 
-                # Collect first 5 samples for plotting
-                if len(collected_samples) < 5:
+                # Collect first 3 samples for plotting
+                if len(collected_samples) < 3:
                     batch_size_actual = preds.shape[0]
-                    for b in range(min(batch_size_actual, 5 - len(collected_samples))):
+                    for b in range(min(batch_size_actual, 3 - len(collected_samples))):
                         # Get original context and apply same downsampling
                         original_context = batch['inputs'][b].cpu().numpy()
                         downsampled_context = original_context[::downsample_rate]
@@ -356,6 +377,7 @@ def evaluate(args):
         print("SELF-INFORMATION BASED EVALUATION")
         print("Computing self-information scores for 3 random context samples...")
         print(f"Using fixed SI context length: {args.si_context_length}")
+        print(f"Using stride for SI computation: {args.si_stride}")
         print("="*60)
         
         # Use the model with downsample_rate=1 for SI computation
@@ -363,7 +385,7 @@ def evaluate(args):
             args.model,
             device,
             context_length=args.si_context_length,  # Use SI context length for model
-            prediction_length=1,  # Single-step prediction for SI
+            prediction_length=args.si_stride,  # Use stride as prediction length for efficiency
             downsample_rate=1
         )
         
@@ -450,25 +472,22 @@ def plot_results(results, args):
 
 
 def plot_sample_predictions(sample_data, args):
-    """Plot 5 randomly selected samples showing input context, ground truth, and predictions."""
+    """Plot 3 randomly selected samples showing input context, ground truth, and predictions."""
     if not sample_data:
         return
         
-    # Create base directory structure
+    # Create base directory structure - same as SI plots
     dataset_name = os.path.basename(args.data).split('.')[0]
     base_results_dir = f"results_with_si/{dataset_name}/col_{args.data_col_idx}"
-    samples_dir = f"{base_results_dir}/sample_predictions_p{args.prediction_length}_c{args.context_length}"
+    samples_dir = f"{base_results_dir}/p{args.prediction_length}_c{args.context_length}_stride{args.si_stride}"
     os.makedirs(samples_dir, exist_ok=True)
     
-    # Select 5 random samples
-    import random
-    random.seed(42)  # For reproducible results
+    # Select sample keys
     sample_keys = list(sample_data.keys())
-    # Use downsample_rates order instead of random selection
     selected_samples = [rate for rate in args.downsample_rates if rate in sample_keys]
     
-    # Create individual plots for each sample
-    for sample_idx in range(5):
+    # Create individual plots for each sample (0, 1, 2)
+    for sample_idx in range(3):
         # Check if we have enough samples
         if any(sample_idx >= len(sample_data[rate]) for rate in selected_samples):
             break
@@ -494,7 +513,6 @@ def plot_sample_predictions(sample_data, args):
             pred_len = len(prediction)
             
             # Time indices should show the original positions of the downsampled data
-            # The data is already downsampled, so we just need proper spacing
             context_time = np.arange(-context_len * rate, 0, rate)
             pred_time = np.arange(0, pred_len * rate, rate)
             
@@ -517,16 +535,16 @@ def plot_sample_predictions(sample_data, args):
                 ax.set_xlabel('Time Steps', fontsize=12)
             ax.set_ylabel('Value', fontsize=12)
         
-        plt.suptitle(f'Sample {sample_idx+1} - Prediction Comparison Across Downsample Rates', fontsize=16)
+        plt.suptitle(f'Sample {sample_idx} - Prediction Comparison Across Downsample Rates', fontsize=16)
         plt.tight_layout()
         
-        # Save individual plot
-        plot_filename = f"{samples_dir}/sample_{sample_idx+1}.png"
+        # Save individual plot with relative sample number
+        plot_filename = f"{samples_dir}/prediction_sample_{sample_idx}.png"
         plt.savefig(plot_filename, dpi=300, bbox_inches='tight')
         plt.close()  # Close to free memory
         
-    print(f"Individual sample plots saved in: {samples_dir}/")
-    print(f"Generated {min(5, min(len(sample_data[rate]) for rate in selected_samples))} individual sample plots")
+    print(f"Prediction plots saved in: {samples_dir}/")
+    print(f"Generated {min(3, min(len(sample_data[rate]) for rate in selected_samples))} prediction sample plots")
 
 
 def create_temp_csv(csv_file, date_col_idx, data_col_idx):
@@ -575,13 +593,13 @@ def create_temp_csv(csv_file, date_col_idx, data_col_idx):
 def plot_si_for_samples(model, dataset, selected_indices, device, args):
     """Plot self-information analysis for selected samples - create separate plots for each sample."""
     
-    # Create directory for SI plots
+    # Create directory for SI plots - same as prediction plots
     dataset_name = os.path.basename(args.data).split('.')[0]
     base_results_dir = f"results_with_si/{dataset_name}/col_{args.data_col_idx}"
-    si_dir = f"{base_results_dir}/si_analysis_p{args.prediction_length}_c{args.context_length}"
+    si_dir = f"{base_results_dir}/p{args.prediction_length}_c{args.context_length}_stride{args.si_stride}"
     os.makedirs(si_dir, exist_ok=True)
     
-    # Process each sample with progress bar
+    # Process each sample with progress bar using relative sample numbers (0, 1, 2)
     for plot_idx, sample_idx in enumerate(tqdm(selected_indices, desc="Processing samples", unit="sample")):
         sample = dataset[sample_idx]
         context_data = sample['inputs']
@@ -592,22 +610,21 @@ def plot_si_for_samples(model, dataset, selected_indices, device, args):
         elif not isinstance(context_data, np.ndarray):
             context_data = np.array(context_data)
         
-        print(f"Processing sample {sample_idx}: context length = {len(context_data)}")
+        print(f"Processing sample {plot_idx}: context length = {len(context_data)}")
         
         # Compute self-information scores
         si_scores, si_predictions = compute_self_information(
-            model, context_data, device, args.si_context_length
+            model, context_data, device, args.si_context_length, args.si_stride
         )
         
         # Extract only the portion of context for which we computed SI
-        # This corresponds to the original context window, not the extended one
         si_start_idx = args.si_context_length  # Start of SI computation
         si_end_idx = len(context_data)  # End of the data
         
         # Get the context portion for which we have SI scores
         relevant_context = context_data[si_start_idx:si_end_idx]
         
-        # Create individual plot for this sample
+        # Create individual plot for this sample using relative sample number
         fig, ax = plt.subplots(1, 1, figsize=(15, 8))
         
         # Plot only the relevant context signal (for which we computed SI)
@@ -624,7 +641,7 @@ def plot_si_for_samples(model, dataset, selected_indices, device, args):
         ax2.plot(si_positions, si_scores, 'g-.o', alpha=0.6, markersize=6, linewidth=1, label='Self-Information (MSE)')
         
         # Formatting
-        ax.set_title(f'Sample {sample_idx}: Context Signal, Predictions, and Self-Information', fontsize=16)
+        ax.set_title(f'Sample {plot_idx}: Context Signal, Predictions, and Self-Information (Stride={args.si_stride})', fontsize=16)
         ax.set_xlabel('Position in Context Window', fontsize=12)
         ax.set_ylabel('Signal Value', color='b', fontsize=12)
         ax2.set_ylabel('Self-Information (MSE)', color='g', fontsize=12)
@@ -640,8 +657,8 @@ def plot_si_for_samples(model, dataset, selected_indices, device, args):
         
         plt.tight_layout()
         
-        # Save individual plot
-        plot_filename = f"{si_dir}/si_sample_{sample_idx}.png"
+        # Save individual plot with relative sample number
+        plot_filename = f"{si_dir}/si_sample_{plot_idx}.png"
         plt.savefig(plot_filename, dpi=300, bbox_inches='tight')
         plt.close()  # Close to free memory
         
@@ -670,7 +687,7 @@ def plot_si_for_samples(model, dataset, selected_indices, device, args):
             ax2_zoom.plot(zoom_si_positions, zoom_si_scores, 'g-.o', alpha=0.6, markersize=6, linewidth=1, label='Self-Information (MSE)')
             
             # Formatting for zoomed plot
-            ax_zoom.set_title(f'Sample {sample_idx}: Zoomed View (Last {zoom_samples} samples)', fontsize=16)
+            ax_zoom.set_title(f'Sample {plot_idx}: Zoomed View (Last {zoom_samples} samples, Stride={args.si_stride})', fontsize=16)
             ax_zoom.set_xlabel('Position in Context Window', fontsize=12)
             ax_zoom.set_ylabel('Signal Value', color='b', fontsize=12)
             ax2_zoom.set_ylabel('Self-Information (MSE)', color='g', fontsize=12)
@@ -686,8 +703,8 @@ def plot_si_for_samples(model, dataset, selected_indices, device, args):
             
             plt.tight_layout()
             
-            # Save zoomed plot
-            zoom_plot_filename = f"{si_dir}/si_sample_{sample_idx}_zoom.png"
+            # Save zoomed plot with relative sample number
+            zoom_plot_filename = f"{si_dir}/si_sample_{plot_idx}_zoom.png"
             plt.savefig(zoom_plot_filename, dpi=300, bbox_inches='tight')
             plt.close()  # Close to free memory
             
@@ -700,14 +717,7 @@ def plot_si_for_samples(model, dataset, selected_indices, device, args):
         print(f"  Full plot saved as: {plot_filename}")
     
     print(f"\nAll self-information plots saved in: {si_dir}/")
-    print(f"Generated {len(selected_indices)} individual sample plots")
-
-
-# Remove the old plotting function
-def plot_si_analysis_old(si_results, args):
-    """Old plotting function - not used anymore."""
-    pass
-
+    print(f"Generated {len(selected_indices)} individual SI sample plots")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('TimeMoE Evaluate')
@@ -781,6 +791,12 @@ if __name__ == '__main__':
         type=int,
         default=None,
         help='Fixed context length for SI computation (default: same as context_length)'
+    )
+    parser.add_argument(
+        '--si_stride',
+        type=int,
+        default=1,
+        help='Number of steps to predict at once for SI computation (default: 1)'
     )
     args = parser.parse_args()
     if args.context_length is None:
