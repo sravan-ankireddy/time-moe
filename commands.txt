@@ -1,0 +1,3 @@
+## training 
+
+NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 python torch_dist_run.py main.py -d /mnt/Data/datasets/Time-300B -m "Maple728/TimeMoE-50M" -o logs_p8_bf16/time_moe --max_length 4096 --global_batch_size 1024 --micro_batch_size 32 --precision bf16 --from_scratch --save_steps 1000 --save_strategy steps --save_total_limit 2

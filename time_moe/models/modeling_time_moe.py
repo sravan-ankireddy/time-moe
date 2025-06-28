@@ -171,19 +171,39 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
 
 class TimeMoeInputEmbedding(nn.Module):
     """
-    Use a mlp layer to embedding the time-series.
+    Use a mlp layer to embedding the time-series patches.
     """
 
     def __init__(self, config: TimeMoeConfig):
         super().__init__()
         self.config = config
         self.input_size = config.input_size  # default 1
+        self.patch_size = config.patch_size  # default 1
         self.hidden_size = config.hidden_size
-        self.emb_layer = nn.Linear(self.input_size, self.hidden_size, bias=False)
-        self.gate_layer = nn.Linear(self.input_size, self.hidden_size, bias=False)
+        
+        # Input dimension is input_size * patch_size for patch embedding
+        patch_input_dim = self.input_size * self.patch_size
+        self.emb_layer = nn.Linear(patch_input_dim, self.hidden_size, bias=False)
+        self.gate_layer = nn.Linear(patch_input_dim, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
+        # x shape: [batch_size, seq_len, input_size]
+        # For patch embedding, we need to reshape to patches
+        batch_size, seq_len, input_size = x.shape
+        
+        if self.patch_size > 1:
+            # Ensure sequence length is divisible by patch_size
+            if seq_len % self.patch_size != 0:
+                # Pad the sequence to make it divisible
+                pad_len = self.patch_size - (seq_len % self.patch_size)
+                x = F.pad(x, (0, 0, 0, pad_len), mode='constant', value=0)
+                seq_len = x.shape[1]
+            
+            # Reshape to patches: [batch_size, num_patches, input_size * patch_size]
+            num_patches = seq_len // self.patch_size
+            x = x.view(batch_size, num_patches, input_size * self.patch_size)
+        
         emb = self.act_fn(self.gate_layer(x)) * self.emb_layer(x)
         return emb
 
@@ -824,18 +844,33 @@ class TimeMoeModel(TimeMoePreTrainedModel):
                 past_key_values = DynamicCache.from_legacy_cache(past_key_values)
             past_key_values_length = past_key_values.get_usable_length(seq_length)
 
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_layer(input_ids)
+
+        # After embedding, the sequence length may change due to patching
+        # Update seq_length and position_ids to match the embedded sequence
+        batch_size, embedded_seq_length, _ = inputs_embeds.shape
+        
         if position_ids is None:
             device = input_ids.device if input_ids is not None else inputs_embeds.device
             position_ids = torch.arange(
-                past_key_values_length, seq_length + past_key_values_length, dtype=torch.long, device=device
+                past_key_values_length, embedded_seq_length + past_key_values_length, dtype=torch.long, device=device
             )
-            # position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
-            position_ids = position_ids.view(-1, seq_length)
+            position_ids = position_ids.view(-1, embedded_seq_length)
         else:
-            position_ids = position_ids.view(-1, seq_length).long()
+            # If position_ids were provided for the original sequence, we need to adjust them for patches
+            if position_ids.shape[-1] != embedded_seq_length:
+                # Subsample position_ids to match the patch-based sequence length
+                device = position_ids.device
+                position_ids = torch.arange(
+                    past_key_values_length, embedded_seq_length + past_key_values_length, dtype=torch.long, device=device
+                )
+                position_ids = position_ids.view(-1, embedded_seq_length)
+            else:
+                position_ids = position_ids.view(-1, embedded_seq_length).long()
 
-        if inputs_embeds is None:
-            inputs_embeds = self.embed_layer(input_ids)
+        # Update seq_length to match the embedded sequence
+        seq_length = embedded_seq_length
 
         # 4d mask is passed through the layers
         attention_mask = _prepare_4d_causal_attention_mask(
@@ -915,8 +950,10 @@ class TimeMoeModel(TimeMoePreTrainedModel):
 
 class TimeMoeOutputLayer(nn.Module):
 
-    def __init__(self, hidden_size: int, horizon_length: int, input_size: int = 1):
+    def __init__(self, hidden_size: int, horizon_length: int, input_size: int = 1, patch_size: int = 8):
         super().__init__()
+        self.patch_size = patch_size
+        self.input_size = input_size
 
         self.out_layer = nn.Linear(
             hidden_size,
@@ -928,12 +965,39 @@ class TimeMoeOutputLayer(nn.Module):
         """
 
         Args:
-            x (torch.FloatTensor): with shape [B, seq_len, hidden_size]
+            x (torch.FloatTensor): with shape [B, num_patches, hidden_size] when using patches
 
         Returns:
-    `       torch.FloatTensor: final prediction with shape [B, seq_len, input_size]
+            torch.FloatTensor: final prediction with shape [B, seq_len, input_size] where seq_len = num_patches * patch_size
         """
-        return self.out_layer(x)
+        # x shape: [batch_size, num_patches, hidden_size]
+        predictions = self.out_layer(x)  # [batch_size, num_patches, input_size * horizon_length]
+        
+        if self.patch_size > 1:
+            # Reshape predictions from patches back to sequence
+            batch_size, num_patches, pred_dim = predictions.shape
+            # pred_dim = input_size * horizon_length
+            # We need to reshape to [batch_size, num_patches * patch_size, input_size * horizon_length // patch_size]
+            # But since we want the final output to be [batch_size, original_seq_len, input_size],
+            # and original_seq_len = num_patches * patch_size, we need to distribute the horizon_length
+            
+            # First reshape to separate input_size and horizon_length
+            predictions = predictions.view(batch_size, num_patches, self.input_size, -1)
+            # Now predictions shape: [batch_size, num_patches, input_size, horizon_length]
+            
+            # We want to map each patch prediction to patch_size timesteps
+            # So we repeat each patch prediction patch_size times along the sequence dimension
+            horizon_length = predictions.shape[-1]
+            predictions = predictions.unsqueeze(2).repeat(1, 1, self.patch_size, 1, 1)
+            # Now shape: [batch_size, num_patches, patch_size, input_size, horizon_length]
+            
+            # Reshape to [batch_size, num_patches * patch_size, input_size, horizon_length]
+            predictions = predictions.view(batch_size, num_patches * self.patch_size, self.input_size, horizon_length)
+            
+            # Finally reshape to [batch_size, num_patches * patch_size, input_size * horizon_length]
+            predictions = predictions.view(batch_size, num_patches * self.patch_size, self.input_size * horizon_length)
+        
+        return predictions
 
 
 class TimeMoeForPrediction(TimeMoePreTrainedModel, TSGenerationMixin):
@@ -955,6 +1019,7 @@ class TimeMoeForPrediction(TimeMoePreTrainedModel, TSGenerationMixin):
                     hidden_size=self.config.hidden_size,
                     input_size=self.config.input_size,
                     horizon_length=horizon_length,
+                    patch_size=self.config.patch_size,
                 )
             )
             self.horizon_length_map[horizon_length] = i
