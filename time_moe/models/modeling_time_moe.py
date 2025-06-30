@@ -171,7 +171,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
 
 class TimeMoeInputEmbedding(nn.Module):
     """
-    Use a mlp layer to embedding the time-series patches.
+    Use a mlp layer to embedding the time-series patches with alternating patch sizes.
     """
 
     def __init__(self, config: TimeMoeConfig):
@@ -181,31 +181,100 @@ class TimeMoeInputEmbedding(nn.Module):
         self.patch_size = config.patch_size  # default 1
         self.hidden_size = config.hidden_size
         
-        # Input dimension is input_size * patch_size for patch embedding
-        patch_input_dim = self.input_size * self.patch_size
-        self.emb_layer = nn.Linear(patch_input_dim, self.hidden_size, bias=False)
-        self.gate_layer = nn.Linear(patch_input_dim, self.hidden_size, bias=False)
+        # For alternating patch sizes: patch_size and patch_size // 2
+        self.patch_size_large = self.patch_size
+        self.patch_size_small = max(1, self.patch_size // 2)
+        
+        # Create embedding layers for both patch sizes
+        # Large patch size
+        patch_input_dim_large = self.input_size * self.patch_size_large
+        self.emb_layer_large = nn.Linear(patch_input_dim_large, self.hidden_size, bias=False)
+        self.gate_layer_large = nn.Linear(patch_input_dim_large, self.hidden_size, bias=False)
+        
+        # Small patch size
+        patch_input_dim_small = self.input_size * self.patch_size_small
+        self.emb_layer_small = nn.Linear(patch_input_dim_small, self.hidden_size, bias=False)
+        self.gate_layer_small = nn.Linear(patch_input_dim_small, self.hidden_size, bias=False)
+        
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
         # x shape: [batch_size, seq_len, input_size]
-        # For patch embedding, we need to reshape to patches
         batch_size, seq_len, input_size = x.shape
         
         if self.patch_size > 1:
-            # Ensure sequence length is divisible by patch_size
-            if seq_len % self.patch_size != 0:
-                # Pad the sequence to make it divisible
-                pad_len = self.patch_size - (seq_len % self.patch_size)
+            # Calculate LCM of both patch sizes for padding
+            lcm_patch_size = (self.patch_size_large * self.patch_size_small) // math.gcd(self.patch_size_large, self.patch_size_small)
+            
+            # Ensure sequence length is divisible by LCM
+            if seq_len % lcm_patch_size != 0:
+                pad_len = lcm_patch_size - (seq_len % lcm_patch_size)
                 x = F.pad(x, (0, 0, 0, pad_len), mode='constant', value=0)
                 seq_len = x.shape[1]
             
-            # Reshape to patches: [batch_size, num_patches, input_size * patch_size]
-            num_patches = seq_len // self.patch_size
-            x = x.view(batch_size, num_patches, input_size * self.patch_size)
+            # Optimized alternating patches creation using vectorized operations
+            patch_cycle = self.patch_size_large + self.patch_size_small
+            num_cycles = seq_len // patch_cycle
+            
+            all_patches = []
+            
+            # Process complete cycles in a vectorized manner
+            if num_cycles > 0:
+                # Reshape into cycles: [batch_size, num_cycles, patch_cycle, input_size]
+                cycles = x[:, :num_cycles * patch_cycle, :].view(batch_size, num_cycles, patch_cycle, input_size)
+                
+                # Split each cycle into large and small patches
+                large_patches_raw = cycles[:, :, :self.patch_size_large, :].contiguous()  # [B, num_cycles, large_size, input_size]
+                small_patches_raw = cycles[:, :, self.patch_size_large:, :].contiguous()  # [B, num_cycles, small_size, input_size]
+                
+                # Reshape for batch processing
+                large_patches_flat = large_patches_raw.view(batch_size, num_cycles, input_size * self.patch_size_large)
+                small_patches_flat = small_patches_raw.view(batch_size, num_cycles, input_size * self.patch_size_small)
+                
+                # Process all large patches at once
+                large_emb = self.act_fn(self.gate_layer_large(large_patches_flat)) * self.emb_layer_large(large_patches_flat)
+                # Process all small patches at once
+                small_emb = self.act_fn(self.gate_layer_small(small_patches_flat)) * self.emb_layer_small(small_patches_flat)
+                
+                # Interleave large and small patches
+                # Create output tensor: [batch_size, num_cycles * 2, hidden_size]
+                cycle_patches = torch.zeros(batch_size, num_cycles * 2, self.hidden_size, device=x.device, dtype=x.dtype)
+                cycle_patches[:, ::2, :] = large_emb  # Even indices for large patches
+                cycle_patches[:, 1::2, :] = small_emb  # Odd indices for small patches
+                
+                all_patches.append(cycle_patches)
+            
+            # Handle remainder
+            remainder_start = num_cycles * patch_cycle
+            if remainder_start < seq_len:
+                remainder = seq_len - remainder_start
+                remainder_data = x[:, remainder_start:, :]
+                
+                if remainder >= self.patch_size_large:
+                    # Process remaining large patch
+                    large_patch = remainder_data[:, :self.patch_size_large, :].view(batch_size, 1, input_size * self.patch_size_large)
+                    large_emb = self.act_fn(self.gate_layer_large(large_patch)) * self.emb_layer_large(large_patch)
+                    all_patches.append(large_emb)
+                    
+                    # Check for remaining small patch
+                    if remainder >= self.patch_size_large + self.patch_size_small:
+                        small_patch = remainder_data[:, self.patch_size_large:self.patch_size_large + self.patch_size_small, :].view(batch_size, 1, input_size * self.patch_size_small)
+                        small_emb = self.act_fn(self.gate_layer_small(small_patch)) * self.emb_layer_small(small_patch)
+                        all_patches.append(small_emb)
+            
+            # Concatenate all patches
+            if all_patches:
+                x = torch.cat(all_patches, dim=1)
+            else:
+                # Fallback
+                emb = self.act_fn(self.gate_layer_large(x)) * self.emb_layer_large(x)
+                x = emb
+        else:
+            # No patching, use original approach with large patch layers
+            emb = self.act_fn(self.gate_layer_large(x)) * self.emb_layer_large(x)
+            x = emb
         
-        emb = self.act_fn(self.gate_layer(x)) * self.emb_layer(x)
-        return emb
+        return x
 
 
 # Copied from transformers.models.mistral.modeling_mistral.MistralRotaryEmbedding with Mistral->TimeMOE
@@ -855,6 +924,8 @@ class TimeMoeModel(TimeMoePreTrainedModel):
             position_ids = position_ids.view(-1, seq_length).long()
 
         if inputs_embeds is None:
+            # Store original sequence length before patching
+            self._original_seq_length = seq_length
             inputs_embeds = self.embed_layer(input_ids)
             # Update sequence length after patching
             _, patched_seq_length, _ = inputs_embeds.shape
@@ -882,6 +953,7 @@ class TimeMoeModel(TimeMoePreTrainedModel):
         else:
             # If inputs_embeds is provided, get the patched sequence length
             _, patched_seq_length, _ = inputs_embeds.shape
+            self._original_seq_length = patched_seq_length  # Assume no patching was done
 
         # 4d mask is passed through the layers
         attention_mask = _prepare_4d_causal_attention_mask(
@@ -966,34 +1038,88 @@ class TimeMoeOutputLayer(nn.Module):
         self.patch_size = patch_size
         self.input_size = input_size
         self.horizon_length = horizon_length
+        
+        # For alternating patch sizes
+        self.patch_size_large = self.patch_size
+        self.patch_size_small = max(1, self.patch_size // 2)
 
-        self.out_layer = nn.Linear(
+        # Separate output layers for each patch size
+        self.out_layer_large = nn.Linear(
             hidden_size,
-            input_size * patch_size * horizon_length,
+            input_size * self.patch_size_large * horizon_length,
+            bias=False,
+        )
+        self.out_layer_small = nn.Linear(
+            hidden_size,
+            input_size * self.patch_size_small * horizon_length,
             bias=False,
         )
 
-    def forward(self, x):
+    def forward(self, x, original_seq_len=None):
         """
         Args:
             x (torch.FloatTensor): with shape [B, num_patches, hidden_size]
+            original_seq_len (int, optional): Original sequence length before patching
 
         Returns:
-            torch.FloatTensor: final prediction with shape [B, seq_len, input_size]
+            torch.FloatTensor: final prediction with shape [B, seq_len, input_size * horizon_length]
         """
         # x shape: [batch_size, num_patches, hidden_size]
         batch_size, num_patches, hidden_size = x.shape
         
-        # Project to output space: [batch_size, num_patches, input_size * patch_size * horizon_length]
-        output = self.out_layer(x)
-        
         if self.patch_size > 1:
-            # Unpatchify: reshape to recover original sequence length
-            # output shape: [batch_size, num_patches, patch_size, input_size * horizon_length]
-            output = output.view(batch_size, num_patches, self.patch_size, self.input_size * self.horizon_length)
+            # Pre-compute indices for efficiency
+            num_large_patches = (num_patches + 1) // 2
+            num_small_patches = num_patches // 2
             
-            # Flatten patches back to sequence: [batch_size, seq_len, input_size * horizon_length]
-            output = output.view(batch_size, num_patches * self.patch_size, self.input_size * self.horizon_length)
+            # Create output tensors for each patch type
+            output_dim = self.input_size * self.horizon_length
+            
+            # Process all large patches at once
+            if num_large_patches > 0:
+                large_patches = x[:, ::2, :]  # Every even index (0, 2, 4, ...)
+                large_raw = self.out_layer_large(large_patches)  # [B, num_large, large_size * horizon * input]
+                large_outputs = large_raw.view(batch_size, num_large_patches, self.patch_size_large, output_dim)
+            else:
+                large_outputs = torch.empty(batch_size, 0, self.patch_size_large, output_dim, device=x.device, dtype=x.dtype)
+            
+            # Process all small patches at once  
+            if num_small_patches > 0:
+                small_patches = x[:, 1::2, :]  # Every odd index (1, 3, 5, ...)
+                small_raw = self.out_layer_small(small_patches)  # [B, num_small, small_size * horizon * input]
+                small_outputs = small_raw.view(batch_size, num_small_patches, self.patch_size_small, output_dim)
+            else:
+                small_outputs = torch.empty(batch_size, 0, self.patch_size_small, output_dim, device=x.device, dtype=x.dtype)
+            
+            # Calculate total sequence length
+            total_seq_len = num_large_patches * self.patch_size_large + num_small_patches * self.patch_size_small
+            
+            # Pre-allocate output tensor
+            output = torch.zeros(batch_size, total_seq_len, output_dim, device=x.device, dtype=x.dtype)
+            
+            # Vectorized interleaving using advanced indexing
+            patch_cycle = self.patch_size_large + self.patch_size_small
+            
+            # Fill large patches
+            for i in range(num_large_patches):
+                start_pos = i * patch_cycle
+                end_pos = start_pos + self.patch_size_large
+                if end_pos <= total_seq_len:
+                    output[:, start_pos:end_pos, :] = large_outputs[:, i, :, :]
+            
+            # Fill small patches
+            for i in range(num_small_patches):
+                start_pos = i * patch_cycle + self.patch_size_large
+                end_pos = start_pos + self.patch_size_small
+                if end_pos <= total_seq_len:
+                    output[:, start_pos:end_pos, :] = small_outputs[:, i, :, :]
+            
+            # Trim to original sequence length if provided
+            if original_seq_len is not None and original_seq_len < total_seq_len:
+                output = output[:, :original_seq_len, :]
+        else:
+            # No patching, use large output layer
+            output = self.out_layer_large(x)
         
         return output
 
@@ -1077,8 +1203,9 @@ class TimeMoeForPrediction(TimeMoePreTrainedModel, TSGenerationMixin):
         if labels is not None:
             # AutoRegressive loss
             ar_loss = 0.0
+            original_seq_len = getattr(self.model, '_original_seq_length', None)
             for lm_head, horizon_length in zip(self.lm_heads, self.config.horizon_lengths):
-                one_predictions = lm_head(hidden_states)
+                one_predictions = lm_head(hidden_states, original_seq_len)
                 one_loss = self.calc_ar_loss(one_predictions, labels, loss_masks, horizon_length)
                 ar_loss += one_loss
                 if predictions is None:
@@ -1107,7 +1234,8 @@ class TimeMoeForPrediction(TimeMoePreTrainedModel, TSGenerationMixin):
                     else:
                         horizon_length = h
             lm_head = self.lm_heads[self.horizon_length_map[horizon_length]]
-            predictions = lm_head(hidden_states)
+            original_seq_len = getattr(self.model, '_original_seq_length', None)
+            predictions = lm_head(hidden_states, original_seq_len)
             if horizon_length > max_horizon_length:
                 predictions = predictions[:, :, : self.config.input_size * max_horizon_length]
 
