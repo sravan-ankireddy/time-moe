@@ -5,6 +5,12 @@ import argparse
 import matplotlib.pyplot as plt
 import os
 import glob
+try:
+    from datasets import load_from_disk
+    HF_DATASETS_AVAILABLE = True
+except ImportError:
+    HF_DATASETS_AVAILABLE = False
+    print("Warning: datasets library not available. HuggingFace dataset support disabled.")
 
 def compute_entropy_and_scaled(x, B, pooled_scaled_data=None, context_length=None):
     """Compute scaled signal and per-sample entropy."""
@@ -49,8 +55,105 @@ def compute_entropy_and_scaled(x, B, pooled_scaled_data=None, context_length=Non
     
     return scaled, per_sample_entropy
 
-def load_and_scale_all_data(datasets_dir: str):
-    """Load and scale all columns from all CSV files."""
+def load_huggingface_dataset(dataset_path: str, max_samples_per_split: int = None):
+    """Load numeric data from multiple HuggingFace dataset directories."""
+    if not HF_DATASETS_AVAILABLE:
+        raise ImportError("datasets library is required for HuggingFace dataset support. Install with: pip install datasets")
+    
+    print(f"Loading HuggingFace datasets from {dataset_path}")
+    
+    all_scaled_data = []
+    total_samples = 0
+    
+    # Find all subdirectories that contain dataset files
+    dataset_dirs = []
+    for item in os.listdir(dataset_path):
+        item_path = os.path.join(dataset_path, item)
+        if os.path.isdir(item_path):
+            # Check if this directory contains dataset files
+            has_arrow = any(f.endswith('.arrow') for f in os.listdir(item_path))
+            has_state = os.path.exists(os.path.join(item_path, 'state.json'))
+            if has_arrow or has_state:
+                dataset_dirs.append(item_path)
+    
+    print(f"Found {len(dataset_dirs)} dataset directories")
+    
+    for dataset_dir in dataset_dirs:
+        try:
+            print(f"Loading dataset from {dataset_dir}")
+            dataset = load_from_disk(dataset_dir)
+            
+            # Handle both single Dataset and DatasetDict
+            if hasattr(dataset, 'keys'):
+                # DatasetDict - process each split
+                for split_name in dataset.keys():
+                    split_data = dataset[split_name]
+                    processed_samples = process_dataset_split(split_data, max_samples_per_split)
+                    all_scaled_data.extend(processed_samples)
+                    total_samples += sum(len(data) for data in processed_samples)
+            else:
+                # Single Dataset
+                processed_samples = process_dataset_split(dataset, max_samples_per_split)
+                all_scaled_data.extend(processed_samples)
+                total_samples += sum(len(data) for data in processed_samples)
+                
+        except Exception as e:
+            print(f"Warning: Failed to load dataset from {dataset_dir}: {e}")
+            continue
+    
+    if not all_scaled_data:
+        raise ValueError("No valid numeric data found in any HuggingFace datasets")
+    
+    pooled_scaled = np.concatenate(all_scaled_data)
+    print(f"Total pooled scaled samples from HuggingFace datasets: {len(pooled_scaled)}")
+    return pooled_scaled
+
+def process_dataset_split(split_data, max_samples_per_split):
+    """Process a single dataset split and extract numeric data."""
+    processed_data = []
+    
+    split_limit = len(split_data)
+    if max_samples_per_split is not None:
+        split_limit = min(split_limit, max_samples_per_split)
+    
+    for i, row in enumerate(split_data.select(range(split_limit))):
+        if i >= split_limit:
+            break
+            
+        # Extract numeric values from all fields in the row
+        for field_name, field_value in row.items():
+            try:
+                if isinstance(field_value, (list, tuple)):
+                    numeric_data = np.array(field_value, dtype=float)
+                    if numeric_data.size > 0 and not np.all(np.isnan(numeric_data)):
+                        clean_data = numeric_data[~np.isnan(numeric_data)]
+                        if len(clean_data) > 0:
+                            s = np.mean(np.abs(clean_data))
+                            if s > 0:
+                                processed_data.append(clean_data / s)
+                elif isinstance(field_value, (int, float)):
+                    if not np.isnan(float(field_value)):
+                        val = float(field_value)
+                        if val != 0:
+                            processed_data.append(np.array([val / abs(val)]))
+                elif isinstance(field_value, str):
+                    try:
+                        val = float(field_value)
+                        if not np.isnan(val) and val != 0:
+                            processed_data.append(np.array([val / abs(val)]))
+                    except ValueError:
+                        continue
+            except (ValueError, TypeError, OverflowError):
+                continue
+    
+    return processed_data
+
+def load_and_scale_all_data(datasets_dir: str, use_huggingface: bool = False, max_samples_per_split: int = None):
+    """Load and scale all columns from all CSV files or HuggingFace dataset."""
+    if use_huggingface:
+        return load_huggingface_dataset(datasets_dir, max_samples_per_split)
+    
+    # Original CSV loading logic
     all_scaled_data = []
     csv_files = glob.glob(os.path.join(datasets_dir, "**", "*.csv"), recursive=True)
     
@@ -173,50 +276,8 @@ def print_patch_stats(patches):
     unique_sizes = sorted(set(sizes))[:10]
     print(f"Top sizes: {', '.join(f'{s}({sum(1 for x in sizes if x == s)})' for s in unique_sizes)}")
 
-def plot_patches(scaled, per_sample_entropy, patches, title_suffix, output_path):
-    """Plot 3 patches with different entropy levels."""
-    sorted_patches = sorted(patches, key=lambda p: p['mean_entropy'])
-    selected = [sorted_patches[0], sorted_patches[len(sorted_patches)//2], sorted_patches[-1]]
-    
-    fig, axes = plt.subplots(3, 1, figsize=(14, 10))
-    
-    # Calculate global y-limits for consistency
-    all_scaled = np.concatenate([p['scaled'] for p in selected])
-    all_entropy = np.concatenate([p['entropy'] for p in selected])
-    scaled_ylim = (np.min(all_scaled), np.max(all_scaled))
-    entropy_ylim = (np.min(all_entropy), np.max(all_entropy))
-    
-    labels = ['Low entropy', 'Medium entropy', 'High entropy']
-    
-    for i, (patch, label) in enumerate(zip(selected, labels)):
-        indices = np.arange(patch['start'], patch['end'])
-        
-        ax1 = axes[i]
-        ax1.plot(indices, patch['scaled'], 'C0', linewidth=1.2)
-        ax1.set_ylabel("Scaled value", color="C0")
-        ax1.tick_params(axis="y", labelcolor="C0")
-        ax1.set_ylim(scaled_ylim)
-        ax1.axvspan(patch['start'], patch['end'], alpha=0.1, color='gray')
-        
-        ax2 = ax1.twinx()
-        ax2.plot(indices, patch['entropy'], 'C1', linewidth=1.2)
-        ax2.set_ylabel("Entropy (bits)", color="C1")
-        ax2.tick_params(axis="y", labelcolor="C1")
-        ax2.set_ylim(entropy_ylim)
-        
-        ax1.set_title(f"{label} patch (size {patch['size']}, entropy: {patch['mean_entropy']:.3f})")
-        
-        if i == 2:
-            ax1.set_xlabel("Sample index")
-    
-    plt.suptitle(f"Variable-Size Patches by Entropy {title_suffix}")
-    plt.tight_layout()
-    plt.savefig(output_path)
-    plt.close()
-    print(f"Patch plot saved to {output_path}")
-
 def plot_signal_overview(scaled, per_sample_entropy, patches, portion_length, title_suffix, output_path):
-    """Plot 3 random signal portions with patch boundaries."""
+    """Plot 3 random signal portions with patch boundaries as markers."""
     if len(scaled) < portion_length:
         raise ValueError(f"Signal too short ({len(scaled)}) for portion length {portion_length}")
     
@@ -244,18 +305,20 @@ def plot_signal_overview(scaled, per_sample_entropy, patches, portion_length, ti
         indices = np.arange(start, end)
         
         ax1 = axes[i]
-        ax1.plot(indices, scaled[start:end], 'C0', alpha=0.8)
+        # Plot data with markers and dash-dot line style
+        ax1.plot(indices, scaled[start:end], '-.o', color='C0', alpha=0.8, markersize=4)
         ax1.set_ylabel("Scaled value", color="C0")
         ax1.tick_params(axis="y", labelcolor="C0")
         ax1.set_ylim(scaled_ylim)
         
-        # Add patch boundaries
+        # Add patch boundaries as dotted vertical lines
         relevant_patches = [p for p in patches if p['start'] < end and p['end'] > start]
         for patch in relevant_patches:
             patch_start = max(patch['start'], start)
+            patch_end = min(patch['end'], end)
             ax1.axvline(patch_start, color='k', linestyle=':', alpha=0.7)
-        if relevant_patches and relevant_patches[-1]['end'] <= end:
-            ax1.axvline(relevant_patches[-1]['end'], color='k', linestyle=':', alpha=0.7)
+            if patch_end < end:
+                ax1.axvline(patch_end, color='k', linestyle=':', alpha=0.7)
         
         ax2 = ax1.twinx()
         ax2.plot(indices, per_sample_entropy[start:end], 'C1', alpha=0.8)
@@ -282,12 +345,22 @@ def main():
     parser.add_argument("--use_global", action="store_true", help="Use global vocabulary")
     parser.add_argument("--use_contextual", action="store_true", help="Use contextual vocabulary")
     parser.add_argument("--context_length", type=int, default=1024, help="Context window length")
+    
+    # Global vocabulary options
+    parser.add_argument("--global_data_path", default="./datasets/ETT-small", 
+                       help="Path to directory containing CSV files or HuggingFace dataset")
+    parser.add_argument("--use_huggingface", action="store_true", 
+                       help="Use HuggingFace dataset format instead of CSV files for global vocabulary")
+    parser.add_argument("--max_samples_per_split", type=int, default=None,
+                       help="Maximum samples to load per dataset split (for large HuggingFace datasets)")
+    
+    # Patch parameters
     parser.add_argument("--min_patch_size", type=int, default=2, help="Minimum patch size")
     parser.add_argument("--max_patch_size", type=int, default=64, help="Maximum patch size")
     parser.add_argument("--entropy_stability_threshold", type=float, default=0.3, help="Stability threshold")
     parser.add_argument("--growth_factor", type=float, default=1.2, help="Patch growth factor")
     parser.add_argument("--spike_absolute_threshold", type=float, default=1.0, help="Spike threshold")
-    parser.add_argument("--plot_portion_length", type=int, default=128, help="Plot portion length")
+    parser.add_argument("--plot_portion_length", type=int, default=256, help="Plot portion length")
     args = parser.parse_args()
 
     # Load data
@@ -304,10 +377,20 @@ def main():
         raise ValueError("Cannot use both global and contextual modes")
     
     if args.use_global:
-        print("Using global vocabulary...")
-        pooled_data = load_and_scale_all_data("./datasets/ETT-small")
+        if args.use_huggingface:
+            print(f"Using global vocabulary from HuggingFace dataset at {args.global_data_path}...")
+            if args.max_samples_per_split:
+                print(f"Limiting to {args.max_samples_per_split} samples per split")
+        else:
+            print(f"Using global vocabulary from CSV files in {args.global_data_path}...")
+        
+        pooled_data = load_and_scale_all_data(
+            args.global_data_path, 
+            use_huggingface=args.use_huggingface,
+            max_samples_per_split=args.max_samples_per_split
+        )
         scaled, entropy = compute_entropy_and_scaled(x, args.bins, pooled_scaled_data=pooled_data)
-        vocab_type = "global"
+        vocab_type = "global_hf" if args.use_huggingface else "global"
     elif args.use_contextual:
         print(f"Using contextual vocabulary (length {args.context_length})...")
         scaled, entropy = compute_entropy_and_scaled(x, args.bins, context_length=args.context_length)
@@ -331,17 +414,14 @@ def main():
 
     # Setup output
     dataset_name = os.path.splitext(os.path.basename(args.csv_path))[0]
-    output_dir = f"var_patches/{dataset_name}/col_{args.column}"
+    output_dir = f"entropy_patches/{dataset_name}/col_{args.column}"
     os.makedirs(output_dir, exist_ok=True)
     
     title_suffix = f"({vocab_type}) - col {args.column}, B={args.bins}"
     filename_suffix = f"{vocab_type}_col{args.column}_bins{args.bins}_var"
     
-    # Generate plots
-    patch_plot_path = os.path.join(output_dir, f"patches_{filename_suffix}.png")
-    plot_patches(scaled, entropy, patches, title_suffix, patch_plot_path)
-    
-    overview_plot_path = os.path.join(output_dir, f"overview_{filename_suffix}.png")
+    # Generate only overview plot with patch markers
+    overview_plot_path = os.path.join(output_dir, f"sample_{filename_suffix}.png")
     plot_signal_overview(scaled, entropy, patches, args.plot_portion_length, title_suffix, overview_plot_path)
     
     print(f"Mean entropy: {np.mean(entropy):.4f} bits")
